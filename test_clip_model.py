@@ -89,7 +89,7 @@ class PrintClassifier(nn.Module):
 
 # Load model
 model = PrintClassifier(clip_model).to(device)
-checkpoint = torch.load('best_print_classifier_t4_v2.pth', map_location=device, weights_only=False)
+checkpoint = torch.load('best_print_classifier_t4.pth', map_location=device, weights_only=False)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 print(f"Loaded model from epoch {checkpoint['epoch']} with val_acc: {checkpoint['val_acc']:.2f}%")
