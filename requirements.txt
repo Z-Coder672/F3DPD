@@ -1,0 +1,29 @@
+# Core dependencies for Eufy RTSP Streamer
+opencv-python>=4.8.0
+python-dotenv>=0.19.0
+
+# Telegram integration dependencies
+telethon>=1.24.0
+
+# Data science and ML dependencies (for other project components)
+numpy>=1.21.0
+tensorflow>=2.8.0
+keras>=2.8.0
+pillow>=8.0.0
+
+# CLIP-based classifier dependencies (for RPi 4B+ CPU inference)
+torch>=2.0.0
+torchvision>=0.15.0
+git+https://github.com/openai/CLIP.git
+
+# Image processing dependencies
+scikit-image>=0.19.0
+
+# Development and utility dependencies
+requests>=2.25.0
+
+# HTTP streaming dependencies (for HTTP client)
+urllib3>=1.26.0
+
+# Optional: For better OpenCV performance (uncomment if needed)
+# opencv-contrib-python>=4.8.0
