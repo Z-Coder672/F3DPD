@@ -163,3 +163,8 @@ Thumbs.db
 
 # Archive (old inference regime)
 archive/
+
+# Test media / scripts
+dark_test.mp4
+light_test.mp4
+test_brightness.py

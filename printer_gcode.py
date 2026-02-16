@@ -129,3 +129,20 @@ def parse_m23(output: str) -> Optional[dict]:
         "filename": match.group(1).strip(),
         "size": int(match.group(2)),
     }
+
+
+def send_m105() -> Optional[str]:
+    return _send_gcode("M105")
+
+
+def parse_m105(output: str) -> Optional[dict]:
+    t0_match = re.search(r"T0:([\d.]+)/([\d.]+)", output)
+    b_match = re.search(r"B:([\d.]+)/([\d.]+)", output)
+    if not t0_match or not b_match:
+        return None
+    return {
+        "nozzle_current": float(t0_match.group(1)),
+        "nozzle_target": float(t0_match.group(2)),
+        "bed_current": float(b_match.group(1)),
+        "bed_target": float(b_match.group(2)),
+    }

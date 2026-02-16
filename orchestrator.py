@@ -30,7 +30,7 @@ from rpi_ws281x import PixelStrip, Color
 from eufy_rtsp_streamer import EufyRTSPStreamer
 from notifier import TelegramNotifier
 from predictor_clip import predict_failed_from_bgr
-from printer_gcode import send_pause, send_resume, send_m119, send_m27, send_m661, send_m23, parse_m119, parse_m27, parse_m661, parse_m23
+from printer_gcode import send_pause, send_resume, send_m119, send_m27, send_m105, send_m661, send_m23, parse_m119, parse_m27, parse_m105, parse_m661, parse_m23
 import telegram_bot_sender
 
 
@@ -53,8 +53,8 @@ LED_BRIGHTNESS = 255
 LED_INVERT = False
 LED_CHANNEL = 0
 PURE_WHITE = Color(255, 255, 255)
-GREYSCALE_INFERENCES_BEFORE_RECHECK = 12
-GREYSCALE_SATURATION_THRESHOLD = 3
+DARK_INFERENCES_BEFORE_RECHECK = 12
+DARK_BRIGHTNESS_THRESHOLD = 90
 
 
 def decode_jpeg_to_bgr(jpeg_bytes: bytes) -> Optional[np.ndarray]:
@@ -244,15 +244,9 @@ def _sleep_until(next_time: float, max_sleep: float = 0.05) -> float:
     return now
 
 
-def is_frame_greyscale(frame_bgr: np.ndarray) -> bool:
-    b, g, r = cv2.split(frame_bgr)
-    b = b.astype(np.int16)
-    g = g.astype(np.int16)
-    r = r.astype(np.int16)
-    max_ch = np.maximum(np.maximum(r, g), b)
-    min_ch = np.minimum(np.minimum(r, g), b)
-    mean_saturation = float(np.mean(max_ch - min_ch))
-    return mean_saturation < GREYSCALE_SATURATION_THRESHOLD
+def is_frame_dark(frame_bgr: np.ndarray) -> bool:
+    grey = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(grey)) < DARK_BRIGHTNESS_THRESHOLD
 
 
 def _init_led_strip() -> PixelStrip:
@@ -486,6 +480,13 @@ def main() -> None:
                 if parsed_27 is not None:
                     lines.append(f"Layer: {parsed_27['layer_current']}/{parsed_27['layer_total']}")
 
+        raw_m105 = send_m105()
+        if raw_m105 is not None:
+            parsed_105 = parse_m105(raw_m105)
+            if parsed_105 is not None:
+                lines.append(f"Bed temp: {parsed_105['bed_current']:.0f}/{parsed_105['bed_target']:.0f} °C")
+                lines.append(f"Nozzle temp: {parsed_105['nozzle_current']:.0f}/{parsed_105['nozzle_target']:.0f} °C")
+
         telegram_bot_sender.send_message(chat_id, "\n".join(lines))
 
     def _on_listfiles_request(chat_id: int) -> None:
@@ -587,7 +588,7 @@ def main() -> None:
     COOLDOWN_SECONDS = 300.0
     next_frame_at = time.monotonic()
 
-    # LED / greyscale state
+    # LED / darkness state
     led_on = False
     led_on_time = 0.0
     inferences_with_led = 0
@@ -652,10 +653,10 @@ def main() -> None:
             logger.warning("Failed to decode latest frame; skipping check")
             continue
         
-        # --- Greyscale / LED logic (before inference) ---
-        if is_frame_greyscale(frame_bgr):
+        # --- Darkness / LED logic (before inference) ---
+        if is_frame_dark(frame_bgr):
             if not led_on:
-                logger.info("Frame is greyscale (IR mode); turning on LEDs")
+                logger.info("Frame is dark (avg brightness < %d); turning on LEDs", DARK_BRIGHTNESS_THRESHOLD)
                 _leds_on(strip)
                 led_on = True
                 led_on_time = time.monotonic()
@@ -663,12 +664,12 @@ def main() -> None:
 
                 _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
                 check = _grab_bgr(streamer, frame_buffer)
-                if check is not None and is_frame_greyscale(check):
-                    logger.info("Still greyscale after 5s; waiting 5 more")
+                if check is not None and is_frame_dark(check):
+                    logger.info("Still dark after 5s; waiting 5 more")
                     _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
                     check = _grab_bgr(streamer, frame_buffer)
-                    if check is not None and is_frame_greyscale(check):
-                        logger.info("Still greyscale after 10s; waiting 5 more")
+                    if check is not None and is_frame_dark(check):
+                        logger.info("Still dark after 10s; waiting 5 more")
                         _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
 
                 frame_bgr = _grab_bgr(streamer, frame_buffer)
@@ -676,7 +677,7 @@ def main() -> None:
                     continue
                 next_check_at = time.monotonic() + CHECK_INTERVAL
             elif time.monotonic() - led_on_time < 15:
-                logger.debug("LED on < 15s and frame still greyscale; skipping inference")
+                logger.debug("LED on < 15s and frame still dark; skipping inference")
                 continue
 
         try:
@@ -688,15 +689,15 @@ def main() -> None:
         # --- Post-inference LED recheck (every 12 inferences) ---
         if led_on:
             inferences_with_led += 1
-            if inferences_with_led >= GREYSCALE_INFERENCES_BEFORE_RECHECK:
+            if inferences_with_led >= DARK_INFERENCES_BEFORE_RECHECK:
                 logger.info("12 inferences with LED on; turning off to recheck ambient light")
                 _leds_off(strip)
                 led_on = False
                 inferences_with_led = 0
                 _wait_updating_buffer(15, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
                 recheck = _grab_bgr(streamer, frame_buffer)
-                if recheck is not None and is_frame_greyscale(recheck):
-                    logger.info("Still greyscale after recheck; turning LEDs back on")
+                if recheck is not None and is_frame_dark(recheck):
+                    logger.info("Still dark after recheck; turning LEDs back on")
                     _leds_on(strip)
                     led_on = True
                     led_on_time = time.monotonic()
