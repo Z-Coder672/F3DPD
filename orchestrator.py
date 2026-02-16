@@ -4,9 +4,9 @@ F3DPD Orchestrator: headless stream + AI + Telegram DM
 
 Behavior:
 - Start the camera streamer headlessly with infinite retries (80s interval after initial backoff).
-- Maintain a rolling 30-second buffer of frames at 30 fps (900 frames).
-- Every 30s (time.time scheduling), run AI classifier on current frame.
-- On failure detection: stitch a 30s video (buffer leading up to detection), send to Telegram.
+- Maintain a rolling 10-second buffer of frames at 30 fps (300 frames).
+- Every 10s (time.time scheduling), run AI classifier on current frame.
+- On failure detection: stitch a 10s video (buffer leading up to detection), send to Telegram.
 - After alert, enter 5-minute cooldown.
 - Send success notification when connection is established after failures.
 """
@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import tempfile
 from collections import deque
@@ -24,10 +25,13 @@ from typing import Deque, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from rpi_ws281x import PixelStrip, Color
 
 from eufy_rtsp_streamer import EufyRTSPStreamer
 from notifier import TelegramNotifier
 from predictor_clip import predict_failed_from_bgr
+from printer_gcode import send_pause, send_resume, send_m119, send_m27, send_m661, send_m23, parse_m119, parse_m27, parse_m661, parse_m23
+import telegram_bot_sender
 
 
 logging.basicConfig(
@@ -37,8 +41,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-FRAME_BUFFER_SIZE = 900  # 30 seconds at 30 fps
+FRAME_BUFFER_SIZE = 300  # 10 seconds at 30 fps
 TARGET_FPS = 30
+
+# --- WS2812B LED strip configuration ---
+LED_COUNT = 8
+LED_PIN = 18
+LED_FREQ_HZ = 800000
+LED_DMA = 10
+LED_BRIGHTNESS = 255
+LED_INVERT = False
+LED_CHANNEL = 0
+PURE_WHITE = Color(255, 255, 255)
+GREYSCALE_INFERENCES_BEFORE_RECHECK = 12
+GREYSCALE_SATURATION_THRESHOLD = 3
 
 
 def decode_jpeg_to_bgr(jpeg_bytes: bytes) -> Optional[np.ndarray]:
@@ -228,6 +244,65 @@ def _sleep_until(next_time: float, max_sleep: float = 0.05) -> float:
     return now
 
 
+def is_frame_greyscale(frame_bgr: np.ndarray) -> bool:
+    b, g, r = cv2.split(frame_bgr)
+    b = b.astype(np.int16)
+    g = g.astype(np.int16)
+    r = r.astype(np.int16)
+    max_ch = np.maximum(np.maximum(r, g), b)
+    min_ch = np.minimum(np.minimum(r, g), b)
+    mean_saturation = float(np.mean(max_ch - min_ch))
+    return mean_saturation < GREYSCALE_SATURATION_THRESHOLD
+
+
+def _init_led_strip() -> PixelStrip:
+    strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
+                       LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
+    strip.begin()
+    return strip
+
+
+def _leds_on(strip: PixelStrip) -> None:
+    for i in range(LED_COUNT):
+        strip.setPixelColor(i, PURE_WHITE)
+    strip.show()
+
+
+def _leds_off(strip: PixelStrip) -> None:
+    for i in range(LED_COUNT):
+        strip.setPixelColor(i, Color(0, 0, 0))
+    strip.show()
+
+
+def _grab_bgr(streamer, frame_buffer: Deque[bytes]) -> Optional[np.ndarray]:
+    jpeg = streamer.get_current_frame()
+    if jpeg is None and frame_buffer:
+        jpeg = frame_buffer[-1]
+    if jpeg is None:
+        return None
+    return decode_jpeg_to_bgr(jpeg)
+
+
+def _wait_updating_buffer(
+    seconds: float,
+    streamer,
+    frame_buffer: Deque[bytes],
+    buffer_interval: float,
+) -> None:
+    end = time.monotonic() + seconds
+    next_frame = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now >= end:
+            break
+        if now >= next_frame:
+            next_frame = now + buffer_interval
+            fb = streamer.get_current_frame()
+            if fb:
+                frame_buffer.append(fb)
+        time.sleep(min(0.02, max(0, end - time.monotonic())))
+
+
 def main() -> None:
     notifier = TelegramNotifier()
 
@@ -282,12 +357,206 @@ def main() -> None:
                 logger.error("Failed to send reconnection notification: %s", e)
         
         connection_succeeded = True
-        logger.info("Camera connected; building initial 30-second buffer before monitoring")
+        logger.info("Camera connected; building initial 10-second buffer before monitoring")
         break
     
+    # Initialize LED strip and ensure lights are off at start
+    strip = _init_led_strip()
+    _leds_off(strip)
+    logger.info("LED strip initialized and turned off")
+
     # Rolling frame buffer: store JPEG bytes (much smaller than decoded BGR)
     frame_buffer: Deque[bytes] = deque(maxlen=FRAME_BUFFER_SIZE)
-    
+
+    def _on_frame_request(chat_id: int) -> None:
+        """Handle /frame command: send the latest frame to the requesting user."""
+        jpeg = streamer.get_current_frame()
+        if jpeg is None and frame_buffer:
+            jpeg = frame_buffer[-1]
+        if jpeg is None:
+            logger.warning("/frame: no frame available for chat_id %s", chat_id)
+            telegram_bot_sender.send_message(chat_id, "⚠️ No frame available yet.")
+            return
+        success = telegram_bot_sender.send_photo(chat_id, jpeg, caption="F3DPD: Live frame")
+        if success:
+            logger.info("/frame: sent frame to chat_id %s", chat_id)
+        else:
+            logger.error("/frame: failed to send frame to chat_id %s (timed out or API error)", chat_id)
+
+    telegram_bot_sender.set_frame_callback(_on_frame_request)
+
+    def _verify_pause_resume(chat_id: int, action: str, delays: List[int]) -> None:
+        """Background verification loop for pause/resume commands."""
+        if action == "pause":
+            expect_move_mode = "PAUSED"
+        else:
+            expect_machine = "BUILDING_FROM_SD"
+
+        for delay in delays:
+            time.sleep(delay)
+            raw = send_m119()
+            if raw is None:
+                telegram_bot_sender.send_message(chat_id, "Failed to query printer status.")
+                return
+            parsed = parse_m119(raw)
+            if parsed is None:
+                telegram_bot_sender.send_message(chat_id, "Failed to parse printer status.")
+                return
+
+            if action == "pause" and parsed["move_mode"] == expect_move_mode:
+                telegram_bot_sender.send_message(chat_id, "Printer paused successfully.")
+                return
+            if action == "resume" and parsed["machine_status"] == expect_machine and parsed["move_mode"] != "PAUSED":
+                telegram_bot_sender.send_message(chat_id, "Printer resumed successfully.")
+                return
+
+            remaining = delays[delays.index(delay) + 1:]
+            if remaining:
+                next_delay = remaining[0]
+                telegram_bot_sender.send_message(
+                    chat_id,
+                    f"Command sent, but printer not {action}d. Checking again in {next_delay} seconds."
+                )
+            else:
+                telegram_bot_sender.send_message(
+                    chat_id,
+                    f"Command sent, but printer not {action}d. Please check the printer manually."
+                )
+
+    def _on_pause_request(chat_id: int) -> None:
+        send_pause()
+        threading.Thread(
+            target=_verify_pause_resume,
+            args=(chat_id, "pause", [5, 10, 20]),
+            daemon=True,
+        ).start()
+
+    def _on_resume_request(chat_id: int) -> None:
+        raw = send_m119()
+        if raw is not None:
+            parsed = parse_m119(raw)
+            if parsed is not None:
+                ms = parsed["machine_status"]
+                mm = parsed["move_mode"]
+                if ms == "BUILDING_FROM_SD" and mm != "PAUSED":
+                    telegram_bot_sender.send_message(chat_id, "Printer already printing.")
+                    return
+                if ms == "READY":
+                    telegram_bot_sender.send_message(chat_id, "Printer not paused. Status: Ready.")
+                    return
+        send_resume()
+        threading.Thread(
+            target=_verify_pause_resume,
+            args=(chat_id, "resume", [5, 10, 20]),
+            daemon=True,
+        ).start()
+
+    def _on_status_request(chat_id: int) -> None:
+        raw_m119 = send_m119()
+        raw_m27 = send_m27()
+
+        if raw_m119 is None:
+            telegram_bot_sender.send_message(chat_id, "Failed to query printer (M119).")
+            return
+        parsed_119 = parse_m119(raw_m119)
+        if parsed_119 is None:
+            telegram_bot_sender.send_message(chat_id, "Failed to parse printer status.")
+            return
+
+        move_mode = parsed_119["move_mode"]
+        machine_status = parsed_119["machine_status"]
+        current_file = parsed_119["current_file"]
+
+        is_printing = machine_status == "BUILDING_FROM_SD"
+
+        if move_mode == "PAUSED":
+            display_mode = "Paused"
+        elif is_printing:
+            display_mode = "Printing"
+        else:
+            display_mode = machine_status[0].upper() + machine_status[1:].lower().replace("_", " ") if machine_status else "Unknown"
+
+        lines = [display_mode]
+
+        if is_printing or move_mode == "PAUSED":
+            if current_file:
+                lines.append(f"File: {current_file}")
+            if raw_m27 is not None:
+                parsed_27 = parse_m27(raw_m27)
+                if parsed_27 is not None:
+                    lines.append(f"Layer: {parsed_27['layer_current']}/{parsed_27['layer_total']}")
+
+        telegram_bot_sender.send_message(chat_id, "\n".join(lines))
+
+    def _on_listfiles_request(chat_id: int) -> None:
+        raw = send_m661()
+        if raw is None:
+            telegram_bot_sender.send_message(chat_id, "Failed to query printer file list.")
+            return
+        files = parse_m661(raw)
+        if not files:
+            telegram_bot_sender.send_message(chat_id, "No files found on printer.")
+            return
+        telegram_bot_sender.send_message(chat_id, "\n".join(files))
+
+    def _verify_print_started(chat_id: int, filename: str, delays: List[int]) -> None:
+        for delay in delays:
+            time.sleep(delay)
+            raw = send_m119()
+            if raw is None:
+                telegram_bot_sender.send_message(chat_id, "Failed to query printer status.")
+                return
+            parsed = parse_m119(raw)
+            if parsed is None:
+                telegram_bot_sender.send_message(chat_id, "Failed to parse printer status.")
+                return
+
+            if parsed["machine_status"] == "BUILDING_FROM_SD":
+                telegram_bot_sender.send_message(chat_id, f"Printing started: {filename}")
+                return
+
+            remaining = delays[delays.index(delay) + 1:]
+            if remaining:
+                next_delay = remaining[0]
+                telegram_bot_sender.send_message(
+                    chat_id,
+                    f"Print command sent, but printer not printing yet. Checking again in {next_delay}s."
+                )
+            else:
+                telegram_bot_sender.send_message(
+                    chat_id,
+                    "Print command sent, but printer did not start. Please check the printer manually."
+                )
+
+    def _on_print_request(chat_id: int, filename: str) -> None:
+        filepath = f"0:/user/{filename}"
+        raw = send_m23(filepath)
+        if raw is None:
+            telegram_bot_sender.send_message(chat_id, "Failed to send print command to printer.")
+            return
+        parsed = parse_m23(raw)
+        if parsed is None:
+            telegram_bot_sender.send_message(chat_id, "Failed to parse printer response.")
+            return
+        if parsed["size"] == 0:
+            telegram_bot_sender.send_message(chat_id, f"File not found: {filename}")
+            return
+        telegram_bot_sender.send_message(
+            chat_id,
+            f"File selected: {parsed['filename']} ({parsed['size']} bytes). Verifying print starts..."
+        )
+        threading.Thread(
+            target=_verify_print_started,
+            args=(chat_id, filename, [5, 10, 20]),
+            daemon=True,
+        ).start()
+
+    telegram_bot_sender.set_pause_callback(_on_pause_request)
+    telegram_bot_sender.set_resume_callback(_on_resume_request)
+    telegram_bot_sender.set_status_callback(_on_status_request)
+    telegram_bot_sender.set_listfiles_callback(_on_listfiles_request)
+    telegram_bot_sender.set_print_callback(_on_print_request)
+
     # Build initial buffer
     BUFFER_UPDATE_INTERVAL = 1.0 / TARGET_FPS  # ~33ms for 30 fps
     buffer_fill_start = time.monotonic()
@@ -312,10 +581,16 @@ def main() -> None:
     
     # Monitoring loop with cooldown
     cooldown_until = 0.0
+    confirmation_at = 0.0
     next_check_at = 0.0
-    CHECK_INTERVAL = 30.0
+    CHECK_INTERVAL = 10.0
     COOLDOWN_SECONDS = 300.0
     next_frame_at = time.monotonic()
+
+    # LED / greyscale state
+    led_on = False
+    led_on_time = 0.0
+    inferences_with_led = 0
     
     while True:
         now = time.monotonic()
@@ -329,8 +604,34 @@ def main() -> None:
         
         # Respect cooldown: skip checks during cooldown window
         if now < cooldown_until:
+            # Confirmation check 10s into cooldown
+            if confirmation_at > 0 and now >= confirmation_at:
+                confirmation_at = 0.0
+                confirm_jpeg = streamer.get_current_frame()
+                if confirm_jpeg is None and frame_buffer:
+                    confirm_jpeg = frame_buffer[-1]
+                if confirm_jpeg is not None:
+                    confirm_bgr = decode_jpeg_to_bgr(confirm_jpeg)
+                    if confirm_bgr is not None:
+                        try:
+                            confirm_failed, confirm_score = predict_failed_from_bgr(confirm_bgr)
+                        except Exception as e:
+                            logger.error("Confirmation prediction error: %s", e)
+                            confirm_failed = False
+                            confirm_score = 0.0
+                        if confirm_failed:
+                            logger.info("Confirmation check ALSO failed (score: %.3f); auto-pausing print", confirm_score)
+                            send_pause()
+                            notifier.send_text(
+                                "F3DPD repeatedly detected failure. Print has been auto-paused."
+                            )
+                        else:
+                            logger.info("Confirmation check passed (score: %.3f); no auto-pause", confirm_score)
             _sleep_until(next_frame_at, max_sleep=0.02)
             continue
+        elif cooldown_until > 0:
+            logger.info("Cooldown ended; resuming AI monitoring")
+            cooldown_until = 0.0
         
         # monotonic cadence for AI checks
         if now < next_check_at:
@@ -351,19 +652,66 @@ def main() -> None:
             logger.warning("Failed to decode latest frame; skipping check")
             continue
         
+        # --- Greyscale / LED logic (before inference) ---
+        if is_frame_greyscale(frame_bgr):
+            if not led_on:
+                logger.info("Frame is greyscale (IR mode); turning on LEDs")
+                _leds_on(strip)
+                led_on = True
+                led_on_time = time.monotonic()
+                inferences_with_led = 0
+
+                _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
+                check = _grab_bgr(streamer, frame_buffer)
+                if check is not None and is_frame_greyscale(check):
+                    logger.info("Still greyscale after 5s; waiting 5 more")
+                    _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
+                    check = _grab_bgr(streamer, frame_buffer)
+                    if check is not None and is_frame_greyscale(check):
+                        logger.info("Still greyscale after 10s; waiting 5 more")
+                        _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
+
+                frame_bgr = _grab_bgr(streamer, frame_buffer)
+                if frame_bgr is None:
+                    continue
+                next_check_at = time.monotonic() + CHECK_INTERVAL
+            elif time.monotonic() - led_on_time < 15:
+                logger.debug("LED on < 15s and frame still greyscale; skipping inference")
+                continue
+
         try:
             is_failed, score = predict_failed_from_bgr(frame_bgr)
         except Exception as e:
             logger.error("Prediction error: %s", e)
             continue
         
+        # --- Post-inference LED recheck (every 12 inferences) ---
+        if led_on:
+            inferences_with_led += 1
+            if inferences_with_led >= GREYSCALE_INFERENCES_BEFORE_RECHECK:
+                logger.info("12 inferences with LED on; turning off to recheck ambient light")
+                _leds_off(strip)
+                led_on = False
+                inferences_with_led = 0
+                _wait_updating_buffer(15, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
+                recheck = _grab_bgr(streamer, frame_buffer)
+                if recheck is not None and is_frame_greyscale(recheck):
+                    logger.info("Still greyscale after recheck; turning LEDs back on")
+                    _leds_on(strip)
+                    led_on = True
+                    led_on_time = time.monotonic()
+                    _wait_updating_buffer(5, streamer, frame_buffer, BUFFER_UPDATE_INTERVAL)
+                else:
+                    logger.info("Ambient light sufficient; LEDs staying off")
+                next_check_at = time.monotonic() + CHECK_INTERVAL
+
         if is_failed:
-            logger.info("Failure detected (score: %.3f); sending 30-second video", score)
+            logger.info("Failure detected (score: %.3f); sending 10-second video", score)
             
-            # Use the frozen buffer (30 seconds up to detection moment)
+            # Use the frozen buffer (10 seconds up to detection moment)
             all_frames = frozen_buffer
             approx_mb = _estimate_jpeg_buffer_bytes(all_frames) / (1024 * 1024)
-            logger.info("Creating 30s video from %d JPEG frames (~%.1f MiB)", len(all_frames), approx_mb)
+            logger.info("Creating 10s video from %d JPEG frames (~%.1f MiB)", len(all_frames), approx_mb)
             
             # Create temporary video file
             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
@@ -389,7 +737,8 @@ def main() -> None:
                 logger.error("Failed to create video; skipping alert")
             
             cooldown_until = time.monotonic() + COOLDOWN_SECONDS
-            logger.info("Entering cooldown for %.0fs", COOLDOWN_SECONDS)
+            confirmation_at = time.monotonic() + 10.0
+            logger.info("Entering cooldown for %.0fs; confirmation check in 10s", COOLDOWN_SECONDS)
         else:
             logger.info("Print status: Successful (score: %.3f)", score)
 

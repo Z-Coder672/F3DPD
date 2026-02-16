@@ -122,6 +122,12 @@ dmypy.json
 # Session files
 *.session
 
+# User data
+telegram_whitelist.json
+
+# CLIP model cache
+.clip_cache/
+
 # Model files (can be large)
 *.h5
 *.hdf5
